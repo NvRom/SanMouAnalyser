@@ -59,10 +59,10 @@ _NAME_RIGHT_X = (0.55, 0.73)
 
 # 滚动：每次滚轮步进格数（保守小步，配合「滚一步→重检测→去重」反馈，不必精确）。
 # 若游戏不响应滚轮，把 _USE_WHEEL 设为 False 改用拖拽。
-_WHEEL_STEP = 5
+_WHEEL_STEP = 15
 _USE_WHEEL = True
 # 连续多少轮滚动后画面无变化判定到底（容忍偶发滚动无效）。
-_MAX_NO_PROGRESS = 3
+_MAX_NO_PROGRESS = 4
 
 # 战果(result)页底部 tab 栏区域（相对客户区）：含「战果/统计/详情/图表」。
 # 实测底栏 y≈600-650px → ~[0.90,1.0]，左半部即四个标签。result 页独有，list 页没有。
@@ -146,12 +146,15 @@ def _scroll_drag_down(n_entries: float = 1.0) -> None:
     time.sleep(0.6)
 
 
-def _scroll_step() -> None:
-    """向下滚动一步（按 _USE_WHEEL 选择滚轮或拖拽）。"""
+def _scroll_step(factor: float = 1.0) -> None:
+    """向下滚动一步（按 _USE_WHEEL 选择滚轮或拖拽）。
+
+    factor：滚动量倍数。主循环在「连续无进展」时逐步加大，避免步幅过小卡住。
+    """
     if _USE_WHEEL:
-        _scroll_list_down()
+        _scroll_list_down(clicks=int(_WHEEL_STEP * factor))
     else:
-        _scroll_drag_down()
+        _scroll_drag_down(n_entries=1.0 * factor)
 
 
 def _has_list_timestamp(client_img: np.ndarray) -> bool:
@@ -409,7 +412,8 @@ def navigate_and_collect(save_dir=None, max_battles: int = 200) -> list[dict]:
             else:
                 no_progress = 0
             prev_keys = cur_keys
-            _scroll_step()
+            # 无进展时逐步加大滚动量（1x,2x,3x…），避免步幅过小卡住。
+            _scroll_step(factor=1.0 + no_progress)
 
     except NavigationAborted as e:
         print(f"[中止] {e} 已采集 {len(collected)} 条，返回已收集结果。")

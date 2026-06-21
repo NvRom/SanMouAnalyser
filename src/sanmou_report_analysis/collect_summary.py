@@ -28,11 +28,13 @@ def _flatten_summary(key, summary: dict) -> dict:
         team = summary.get("teams", {}).get(side, {})
         hp = team.get("hp")
         prefix = "左" if side == "left" else "右"
+        row[f"{prefix}玩家"] = team.get("player")
         row[f"{prefix}当前兵力"] = hp[0] if hp else None
         row[f"{prefix}初始兵力"] = hp[1] if hp else None
         row[f"{prefix}战损"] = team.get("loss")
         for i, hero in enumerate(team.get("heroes", []), start=1):
             row[f"{prefix}武将{i}"] = hero.get("name")
+            row[f"{prefix}武将{i}红度"] = hero.get("n_red")
             row[f"{prefix}武将{i}战法"] = "/".join(hero.get("skills", []))
     return row
 

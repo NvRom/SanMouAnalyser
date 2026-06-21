@@ -28,6 +28,15 @@ Sanmou Battle Analysis Tool (SBAT)
 uv sync
 ```
 
+### OCR 说明
+
+战果识别依赖 PaddleOCR，仅使用 CPU 推理。已通过以下手段优化速度：
+
+- 使用 **mobile 轻量模型**（比默认 server 模型快 5~10 倍）。
+- 单行小区域采用**仅识别（rec-only）**、跳过文字检测（实测 0.19s→0.03s）。
+- 固定图形元素（如武将红度）用颜色/计数而非 OCR。
+
+
 ### 完整流程（采集 + 分析）（需要管理员权限）
 
 > 该流程依赖 Windows 窗口与输入 API（如 `win32gui`），目前仅支持 Windows。
