@@ -10,13 +10,25 @@
 #   含 `rec_texts` 与 `rec_boxes`（轴对齐 [l, t, r, b]）。
 
 import logging
+import os
+
+# 跳过模型源连通性检查（避免每次启动等待联网探测）。
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 from paddleocr import PaddleOCR
 
 from sanmou_report_analysis.utils.data_structure import OCRResult
 
-OCRer = PaddleOCR(lang="ch", use_textline_orientation=False, enable_mkldnn=False)
-OCRer_number = PaddleOCR(lang="en", use_textline_orientation=False, enable_mkldnn=False)
+# 关闭用不到的文档方向/扭曲矫正模型（少加载两个模型、启动更快），仅保留检测+识别。
+_OCR_KWARGS = {
+    "use_textline_orientation": False,
+    "use_doc_orientation_classify": False,
+    "use_doc_unwarping": False,
+    "enable_mkldnn": False,
+}
+
+OCRer = PaddleOCR(lang="ch", **_OCR_KWARGS)
+OCRer_number = PaddleOCR(lang="en", **_OCR_KWARGS)
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 
 
