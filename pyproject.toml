@@ -27,6 +27,14 @@ dependencies = [
 requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
+[tool.uv]
+# 确保依赖解析覆盖 Windows（win_amd64）。新版 pyqt5-qt5（如 5.15.18）只发布
+# Linux/macOS wheel，会导致 `uv sync` 在 Windows 上报错；声明该环境后，
+# uv 会回退到仍带 Windows wheel 的版本（pyqt5-qt5 5.15.2）。
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/sanmou_report_analysis"]
 
