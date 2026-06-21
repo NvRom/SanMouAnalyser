@@ -133,13 +133,17 @@ def _slot_image(client_img: np.ndarray, slot: str) -> np.ndarray:
 
 
 def _is_folded(client_img: np.ndarray, slot: str) -> bool:
-    """槽位是否折叠态：在折叠区域模板匹配 fold.png。"""
+    """槽位是否折叠态：在折叠区域模板匹配 fold.png。
+
+    are_images_matching 返回 (bool, confidence)。注意第一个值是布尔，
+    不能用 `is not None` 判断（True/False 都不是 None → 永远 True）。
+    """
     region = _crop_rel(client_img, _FOLD_REGION[slot])
     template = read_image(_FOLD_TEMPLATE_PATH)
     if region.size == 0 or template is None:
         return False
-    match_result, _ = are_images_matching(region, template)
-    return match_result is not None
+    matched, _conf = are_images_matching(region, template)
+    return bool(matched)
 
 
 def _slot_key(client_img: np.ndarray, slot: str) -> tuple[str, str, str] | None:
