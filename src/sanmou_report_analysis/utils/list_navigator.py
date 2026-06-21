@@ -99,17 +99,24 @@ def _crop_rel(client_img: np.ndarray, rel_box: list[float]) -> np.ndarray:
     return client_img[top:bottom, left:right]
 
 
+def _log(msg: str) -> None:
+    """打印带时间戳的步骤日志。"""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def _click_relative(rel_xy: tuple[float, float], jitter: int = 6) -> None:
     """点击相对窗口坐标（带轻微随机抖动）。"""
     x, y = convert_relative_xy_to_absolute_wrt_bottom(*rel_xy)
     x += np.random.uniform(-jitter, jitter)
     y += np.random.uniform(-jitter, jitter)
+    _log(f"  → 点击屏幕坐标 ({x:.0f}, {y:.0f})  [相对 {rel_xy}]")
     pyautogui.click(x=x, y=y)
     time.sleep(0.4)
 
 
 def _scroll_up(n_entries: int) -> None:
     """上滑 n 封战报的距离（固定步长）。"""
+    _log(f"  ↑ 上滑 {n_entries} 封战报的距离")
     distance = _ENTRY_HEIGHT * n_entries
     x0 = 0.5
     y0 = 0.7
@@ -150,13 +157,16 @@ def _slot_key(client_img: np.ndarray, slot: str) -> tuple[str, str, str] | None:
 def detect_page(client_img: np.ndarray) -> str:
     """判断当前画面：'result'（战果页）/ 'list'（列表页）/ 'unknown'。
 
-    - 战果页：中央有金色「胜/败」大字 → parse_result 命中。
-    - 列表页：槽1 能 OCR 到有效时间戳。
+    ⚠️ 列表页每条战报中央**也有**「胜/败」大字，因此不能用「胜/败」区分两页。
+    可靠区分信号是**时间戳**：列表页每条右上角有日期时间，战果页没有。
+    故先判列表页（槽位有时间戳），再判战果页（中央有胜/败且无时间戳）。
     """
+    # 列表页：任一槽位能 OCR 到有效时间戳
+    if _slot_key(client_img, "slot1") is not None or _slot_key(client_img, "slot2") is not None:
+        return "list"
+    # 战果页：中央有金色胜/败大字，且上面已确认没有列表时间戳
     if parse_result(client_img) in ("胜", "败"):
         return "result"
-    if _slot_key(client_img, "slot1") is not None:
-        return "list"
     return "unknown"
 
 
@@ -192,28 +202,49 @@ def _process_slot(save_dir, slot: str, idx: int) -> dict:
     避免"返回失败却继续在战果页乱点"。
     """
     # 1) 点击槽位进入战果页，校验确实进入
+    _log(f"[第{idx + 1}封] 在 list 页点击 {slot}，尝试进入 result 页…")
     result_img = None
     for attempt in range(3):
         _check_abort_key()
         _click_relative(_SLOT_CLICK[slot])
         result_img = _wait_for_page("result", timeout=4.0)
         if result_img is not None:
+            _log(f"[第{idx + 1}封] ✓ 成功进入 result 页")
             break
-        print(f"[警告] 点击 {slot} 后未进入战果页，重试 {attempt + 1}/3")
+        _log(f"[第{idx + 1}封] ✗ 点击 {slot} 后未进入 result 页，重试 {attempt + 1}/3")
+        if save_dir is not None:
+            save_image(_capture_client(), save_dir / f"fail_enter_{idx:04d}_{attempt}.png")
     if result_img is None:
         raise NavigationAborted(f"点击 {slot} 多次仍未进入战果页，已中止。")
 
     if save_dir is not None:
         save_image(result_img, save_dir / f"result_{idx:04d}.png")
     summary = extract_battle_summary(result_img)
+    teams = summary.get("teams", {})
+    left_heroes = [h.get("name") for h in teams.get("left", {}).get("heroes", [])]
+    right_heroes = [h.get("name") for h in teams.get("right", {}).get("heroes", [])]
+    _log(
+        f"[第{idx + 1}封] result 页信息：胜负={summary.get('result')} "
+        f"阵型={summary.get('formation')} 左={left_heroes} 右={right_heroes}"
+    )
 
     # 2) 点返回，校验确实回到列表页；失败重试，仍失败则中止
+    _log(f"[第{idx + 1}封] 在 result 页点击返回，尝试回到 list 页…")
     for attempt in range(3):
         _check_abort_key()
         _click_relative(_BACK_CLICK)
         if _wait_for_page("list", timeout=4.0) is not None:
+            _log(f"[第{idx + 1}封] ✓ 成功返回 list 页")
             return summary
-        print(f"[警告] 点击返回后未回到列表页，重试 {attempt + 1}/3")
+        _log(f"[第{idx + 1}封] ✗ 点击返回后未回到 list 页，重试 {attempt + 1}/3")
+        if save_dir is not None:
+            # 存下"点 back 之后程序看到的画面"，用于定位 back 为何失效
+            cur = _capture_client()
+            save_image(cur, save_dir / f"fail_back_{idx:04d}_{attempt}.png")
+            _log(
+                f"        当前页面判定 = {detect_page(cur)!r}"
+                f"（截图已存 fail_back_{idx:04d}_{attempt}.png）"
+            )
     raise NavigationAborted("点击返回多次仍未回到列表页，已中止（避免在战果页乱点）。")
 
 
@@ -234,16 +265,22 @@ def navigate_and_collect(save_dir=None, max_battles: int = 200) -> list[dict]:
 
     try:
         # 起步必须在列表页，否则直接报错而非乱点
+        _log("检查当前是否在 list 页…")
         start = _capture_client()
-        if detect_page(start) != "list":
+        start_page = detect_page(start)
+        _log(f"当前页面判定 = {start_page!r}")
+        if start_page != "list":
+            if save_dir is not None:
+                save_image(start, save_dir / "fail_start_not_list.png")
             raise NavigationAborted(
                 "未检测到『战报列表』页。请先在游戏中打开战报列表页再按 s 开始。"
             )
+        _log("✓ 已在 list 页，开始采集。")
 
         while len(collected) < max_battles:
             _check_abort_key()
             if stall_rounds >= 3:
-                print("[提示] 连续多轮无新战报，判定已到底或卡住，停止采集。")
+                _log("连续多轮无新战报，判定已到底或卡住，停止采集。")
                 break
 
             client_img = _capture_client()
@@ -251,6 +288,7 @@ def navigate_and_collect(save_dir=None, max_battles: int = 200) -> list[dict]:
 
             # 分支①：槽1 折叠 → 展开，不滑
             if _is_folded(client_img, "slot1"):
+                _log("槽1 为折叠态（连战 N 场），点击展开。")
                 _click_relative(_EXPAND_CLICK)
                 time.sleep(0.6)
                 stall_rounds += 1  # 展开本身不算进展，但用计数兜底防死循环
@@ -258,23 +296,29 @@ def navigate_and_collect(save_dir=None, max_battles: int = 200) -> list[dict]:
 
             key1 = _slot_key(client_img, "slot1")
             if key1 is None:
+                _log("槽1 无有效战报，判定到底，停止。")
                 break  # 槽1 都没有有效战报 → 到底
 
             # 到底判断：滑动后槽1 内容与上轮相同
             if key1 == prev_top_key and key1 in seen:
+                _log("槽1 内容与上轮相同且已处理，判定到底，停止。")
                 break
 
             # 处理槽1
             if key1 not in seen:
+                _log(f"槽1 战报：{key1}")
                 summary = _process_slot(save_dir, "slot1", len(collected))
                 collected.append({"key": key1, "summary": summary})
                 seen.add(key1)
+            else:
+                _log(f"槽1 战报已处理过，跳过：{key1}")
 
             # 重新截屏判断槽2（处理槽1 进出后画面可能微动）
             client_img = _capture_client()
 
             # 分支②：槽2 折叠 → 只滑 1 封，让折叠落到槽1
             if _is_folded(client_img, "slot2"):
+                _log("槽2 为折叠态，只上滑 1 封让其落到槽1。")
                 prev_top_key = key1
                 _scroll_up(1)
                 stall_rounds = 0 if len(collected) > before_count else stall_rounds + 1
@@ -283,9 +327,14 @@ def navigate_and_collect(save_dir=None, max_battles: int = 200) -> list[dict]:
             key2 = _slot_key(client_img, "slot2")
             # 分支③：槽2 普通且有效 → 处理槽2
             if key2 is not None and key2 not in seen:
+                _log(f"槽2 战报：{key2}")
                 summary = _process_slot(save_dir, "slot2", len(collected))
                 collected.append({"key": key2, "summary": summary})
                 seen.add(key2)
+            elif key2 is not None:
+                _log(f"槽2 战报已处理过，跳过：{key2}")
+            else:
+                _log("槽2 无有效战报。")
 
             prev_top_key = key1
             _scroll_up(2)
