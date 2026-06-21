@@ -24,13 +24,12 @@ def _draw_region(img, rel_box, label, color):
 
 
 def run_debug():
+    import cv2
     import keyboard
 
     from sanmou_report_analysis.utils import list_navigator as ln
-    from sanmou_report_analysis.utils.battle_summary import _LIST_REGION, _crop, parse_entry_key
     from sanmou_report_analysis.utils.geometry import init_geometry
     from sanmou_report_analysis.utils.image import save_image
-    from sanmou_report_analysis.utils.ocr import ocr_text
 
     out_dir = Path("./summary/debug")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -57,36 +56,35 @@ def run_debug():
         page = ln.detect_page(client)
         print(f"[detect_page] 判定当前页面 = {page!r}")
 
-        # 2) 打印两个槽位区域 OCR 到的全部文本，帮助定位时间戳/名字
-        for slot in ("slot1", "slot2"):
-            region = ln._crop_rel(client, ln._SLOT_REGION[slot])
-            texts = [o.text for o in ocr_text(region)]
-            key = parse_entry_key(region)
-            print(f"[{slot}] OCR文本={texts}")
-            print(f"[{slot}] 去重键(时间戳,左名,右名)={key}")
+        # 2) 时间戳锚点动态检测当前屏所有战报
+        entries = ln._detect_entries(client)
+        print(f"[detect_entries] 检测到 {len(entries)} 条战报：")
+        for i, e in enumerate(entries):
+            print(
+                f"  #{i}: key={e['key']} ts_y={e['ts_y']:.3f} "
+                f"click={e['click']} clickable={e['clickable']}"
+            )
 
-        # 3) 画出所有标定框，存成可视化图，便于核对区域是否对位
-        import cv2
-
+        # 3) 画出检测结果与关键点，存成可视化图便于核对
         vis = client.copy()
-        _draw_region(vis, ln._SLOT_REGION["slot1"], "slot1", (0, 255, 0))
-        _draw_region(vis, ln._SLOT_REGION["slot2"], "slot2", (0, 255, 0))
-        _draw_region(vis, ln._FOLD_REGION["slot1"], "fold1", (255, 0, 0))
-        _draw_region(vis, ln._FOLD_REGION["slot2"], "fold2", (255, 0, 0))
-        # 返回按钮点（画个圈）
+        h, w = vis.shape[:2]
+        # 时间戳扫描竖带
+        _draw_region(vis, ln._TIMESTAMP_STRIP_REGION, "ts_strip", (0, 200, 255))
+        # result 页底部 tab 栏检测区
+        _draw_region(vis, ln._RESULT_TAB_REGION, "result_tabs", (255, 0, 255))
+        # 每条战报的点击点（绿圈）+ 时间戳线
+        for i, e in enumerate(entries):
+            cx, cy = int(e["click"][0] * w), int(e["click"][1] * h)
+            color = (0, 255, 0) if e["clickable"] else (128, 128, 128)
+            cv2.circle(vis, (cx, cy), 10, color, 2)
+            cv2.putText(vis, f"#{i}", (cx + 12, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            ty = int(e["ts_y"] * h)
+            cv2.line(vis, (int(0.78 * w), ty), (w, ty), (0, 200, 255), 1)
+        # 返回按钮点（红圈）
         bx, by = ln._BACK_CLICK
-        cv2.circle(vis, (int(bx * vis.shape[1]), int(by * vis.shape[0])), 8, (0, 0, 255), 2)
-        cv2.putText(vis, "back", (int(bx * vis.shape[1]) + 10, int(by * vis.shape[0])),
+        cv2.circle(vis, (int(bx * w), int(by * h)), 8, (0, 0, 255), 2)
+        cv2.putText(vis, "back", (int(bx * w) + 10, int(by * h)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        # 槽位点击点
-        for slot in ("slot1", "slot2"):
-            sx, sy = ln._SLOT_CLICK[slot]
-            cv2.circle(vis, (int(sx * vis.shape[1]), int(sy * vis.shape[0])), 8, (0, 255, 255), 2)
-
-        # _LIST_REGION 是相对单条战报，这里相对 slot1 画出来核对
-        h1, w1 = ln._crop_rel(client, ln._SLOT_REGION["slot1"]).shape[:2]
-        save_image(_crop(ln._crop_rel(client, ln._SLOT_REGION["slot1"]), _LIST_REGION["timestamp"]),
-                   out_dir / "slot1_timestamp.png")
 
         save_image(vis, out_dir / "client_annotated.png")
         print(f"[已保存] 标定可视化图 -> {out_dir / 'client_annotated.png'}")

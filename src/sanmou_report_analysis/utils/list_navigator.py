@@ -18,16 +18,13 @@ import time
 import numpy as np
 import pyautogui
 
-from sanmou_report_analysis.utils.battle_summary import (
-    extract_battle_summary,
-    parse_entry_key,
-)
+from sanmou_report_analysis.utils.battle_summary import extract_battle_summary
 from sanmou_report_analysis.utils.control import human_like_move
 from sanmou_report_analysis.utils.geometry import (
     convert_relative_xy_to_absolute_wrt_bottom,
     get_geometry,
 )
-from sanmou_report_analysis.utils.image import are_images_matching, read_image, save_image
+from sanmou_report_analysis.utils.image import save_image
 
 
 class NavigationAborted(RuntimeError):
@@ -41,13 +38,6 @@ pyautogui.FAILSAFE = True
 # 固定坐标 / 步长（相对**客户区**，origin=客户区左上角，按客户区宽/高归一）。
 # 已用 1280x665 客户区样例标定（标题栏 31px 已剔除）。仍需在你的窗口微调者标 CALIBRATE。
 # --------------------------------------------------------------------------- #
-# 槽1 / 槽2 的可点中心。y 由实测：槽1 卡片中心 y≈245px→0.322，槽2≈448px→0.627。
-_SLOT_CLICK = {
-    "slot1": (0.46, 0.322),
-    "slot2": (0.46, 0.627),
-}
-# 槽1 折叠时的「展开」按钮可点中心。CALIBRATE（需折叠态截图标定）
-_EXPAND_CLICK = (0.46, 0.322)
 # 战果页「返回」按钮可点中心（左上角弯箭头）。实测列表页同款表头箭头位于
 # 客户区≈(62,24)px → (0.048,0.036)；战果页表头位置一致。如仍未返回请用战果页截图微调。
 _BACK_CLICK = (0.048, 0.04)
@@ -55,26 +45,26 @@ _BACK_CLICK = (0.048, 0.04)
 # 单条战报相对高度：实测两条头部间距 203px / 665 ≈ 0.305。
 _ENTRY_HEIGHT = 0.305
 
-# 槽位区域（相对客户区 [l,t,r,b]），用于折叠判断与去重键 OCR。实测：
-# 槽1 卡片 y[148,315]px→[0.176,0.427]，槽2 y[351,518]px→[0.481,0.732]；右侧留出滚动条。
-_SLOT_REGION = {
-    "slot1": [0.04, 0.176, 0.93, 0.427],
-    "slot2": [0.04, 0.481, 0.93, 0.732],
-}
-# 折叠标志图标在槽位内的子区域（相对客户区）。CALIBRATE（需折叠态截图标定）
-_FOLD_REGION = {
-    "slot1": [0.43, 0.176, 0.50, 0.427],
-    "slot2": [0.43, 0.481, 0.50, 0.732],
-}
-
-# 折叠图标模板（复用现有资源）
-_FOLD_TEMPLATE_PATH = "./images/fold.png"
+# 时间戳锚点定位（稳定，不受「连战 N 场」横幅挤动影响）：
+# 每条战报右上角时间戳的 Y 即该条战报锚点；可点战报区中心 = 时间戳 Y + 偏移。
+_CLICK_X = 0.46  # 点击列横向位置（中央「胜/败」区，点击容错大）
+_TS_TO_CARD_OFFSET = 0.13  # 时间戳中心 → 可点战报区中心 的相对纵向偏移（实测 ≈0.13）
+_MAX_CLICK_Y = 0.85  # 点击点低于此（接近底部）视为被截断，跳过、等滚动后再处理
+# 玩家名相对时间戳的位置（用于去重键 ts+对战双方玩家名，锚定到时间戳 Y）：
+# 实测：玩家名行在 ts_y+0.06；盟名（山海经/藏锋）在更下方。窄框只取玩家名行、排除盟名。
+_NAME_DY = (0.045, 0.085)  # 玩家名行相对时间戳中心的纵向范围（不含下方盟名）
+_NAME_LEFT_X = (0.30, 0.47)
+_NAME_RIGHT_X = (0.55, 0.73)
 
 # 战果(result)页底部 tab 栏区域（相对客户区）：含「战果/统计/详情/图表」。
 # 实测底栏 y≈600-650px → ~[0.90,1.0]，左半部即四个标签。result 页独有，list 页没有。
 _RESULT_TAB_REGION = [0.0, 0.88, 0.55, 1.0]
 # 命中任意 2 个关键词即判定为 result 页（OCR 容错）。
 _RESULT_TAB_KEYWORDS = ("战果", "统计", "详情", "图表", "回放", "分享", "地点", "收藏")
+
+# 列表页时间戳所在的右侧竖条（相对客户区）。时间戳在每条战报右上角，
+# 但「连战 N 场」横幅会上下挤动布局，故用整条竖带扫描、不依赖固定槽位。
+_TIMESTAMP_STRIP_REGION = [0.78, 0.12, 0.97, 0.97]
 
 
 def _capture_client() -> np.ndarray:
@@ -133,40 +123,69 @@ def _scroll_up(n_entries: int) -> None:
     time.sleep(0.6)
 
 
-def _slot_image(client_img: np.ndarray, slot: str) -> np.ndarray:
-    return _crop_rel(client_img, _SLOT_REGION[slot])
+def _has_list_timestamp(client_img: np.ndarray) -> bool:
+    """扫描右侧竖条，判断是否存在「列表页时间戳」。
 
-
-def _is_folded(client_img: np.ndarray, slot: str) -> bool:
-    """槽位是否折叠态：在折叠区域模板匹配 fold.png。
-
-    are_images_matching 返回 (bool, confidence)。注意第一个值是布尔，
-    不能用 `is not None` 判断（True/False 都不是 None → 永远 True）。
+    不依赖固定槽位：逐行 OCR 右侧时间戳竖带，任一行的纯数字 ≥12 位（完整日期时间）
+    即认为是 list 页。可容忍「连战 N 场」横幅造成的上下布局浮动。
     """
-    region = _crop_rel(client_img, _FOLD_REGION[slot])
-    template = read_image(_FOLD_TEMPLATE_PATH)
-    if region.size == 0 or template is None:
-        return False
-    matched, _conf = are_images_matching(region, template)
-    return bool(matched)
+    return len(_detect_entries(client_img)) > 0
 
 
-def _looks_like_datetime(ts: str) -> bool:
-    """判断 OCR 出的数字串是否像「列表页时间戳」。
+def _normalize_name(text: str) -> str:
+    """归一化玩家名：仅保留中文/字母/数字，去掉空格、分隔符与 OCR 噪声。
 
-    列表页时间戳形如 2026/06/21 15:03:03 → 纯数字 14 位。
-    战果页的战损/兵力（如 12013、3974/33000）位数少，借此排除误判。
+    用于去重键，目的是「跨滚动稳定」而非语义完美。OCR 可能把分隔符「|」识别为
+    丢失或杂符，这里统一剔除，使同一玩家名在不同帧得到一致结果。
     """
-    return ts.isdigit() and len(ts) >= 12
+    import re
+
+    return "".join(re.findall(r"[\u4e00-\u9fff0-9a-zA-Z]", text))
 
 
-def _slot_key(client_img: np.ndarray, slot: str) -> tuple[str, str, str] | None:
-    """槽位去重键 (时间戳, 左名, 右名)；时间戳必须是合法日期时间，否则视为空槽返回 None。"""
-    key = parse_entry_key(_slot_image(client_img, slot))
-    ts, _name_l, _name_r = key
-    if not _looks_like_datetime(ts):
-        return None
-    return key
+def _detect_entries(client_img: np.ndarray) -> list[dict]:
+    """时间戳锚点定位：返回当前屏可见的战报条目（按从上到下排序）。
+
+    每条战报右上角的时间戳 Y 即该条战报锚点，不受「连战 N 场」横幅挤动影响。
+    去重键 = 时间戳 + 对战双方玩家名（排除盟名）——可区分「同一秒发生多场战斗」。
+    返回列表，每项：
+      {"ts": 14位数字, "names": (左名,右名), "key": (ts,左名,右名),
+       "ts_y": 时间戳中心相对Y, "click": (x,y) 可点中心, "clickable": bool}
+    """
+    from sanmou_report_analysis.utils.ocr import ocr_text
+
+    h, w = client_img.shape[:2]
+    reg = _TIMESTAMP_STRIP_REGION
+    y0_px = int(reg[1] * h)
+    strip = _crop_rel(client_img, reg)
+
+    entries: list[dict] = []
+    for o in ocr_text(strip):
+        digits = "".join(ch for ch in o.text if ch.isdigit())
+        if len(digits) < 12:
+            continue
+        ts_y = (y0_px + (o.box.t + o.box.b) / 2) / h
+        click_y = ts_y + _TS_TO_CARD_OFFSET
+        # 读取该条双方玩家名（窄框只取玩家名行，排除盟名），并归一化
+        name_box_l = [_NAME_LEFT_X[0], ts_y + _NAME_DY[0], _NAME_LEFT_X[1], ts_y + _NAME_DY[1]]
+        name_box_r = [_NAME_RIGHT_X[0], ts_y + _NAME_DY[0], _NAME_RIGHT_X[1], ts_y + _NAME_DY[1]]
+        raw_left = "".join(x.text for x in ocr_text(_crop_rel(client_img, name_box_l)))
+        raw_right = "".join(x.text for x in ocr_text(_crop_rel(client_img, name_box_r)))
+        name_left = _normalize_name(raw_left)
+        name_right = _normalize_name(raw_right)
+        entries.append(
+            {
+                "ts": digits,
+                "names": (name_left, name_right),
+                # 去重主键：时间戳 + 双方玩家名（同秒多场也能区分）
+                "key": (digits, name_left, name_right),
+                "ts_y": ts_y,
+                "click": (_CLICK_X, click_y),
+                "clickable": click_y <= _MAX_CLICK_Y,
+            }
+        )
+    entries.sort(key=lambda e: e["ts_y"])
+    return entries
 
 
 def _is_result_page(client_img: np.ndarray) -> bool:
@@ -188,14 +207,14 @@ def _is_result_page(client_img: np.ndarray) -> bool:
 def detect_page(client_img: np.ndarray) -> str:
     """判断当前画面：'result'（战果页）/ 'list'（列表页）/ 'unknown'。
 
-    可靠区分信号（避免两页都有的「胜/败」大字造成误判）：
+    可靠区分信号（避免两页都有的「胜/败」大字、以及「连战」横幅挤动布局造成误判）：
     - result 页：底部有「战果/统计/详情/图表」tab 栏（_is_result_page）。
-    - list 页：槽位右上角有合法日期时间戳（_slot_key + 严格校验）。
+    - list 页：右侧竖条任意位置存在合法日期时间戳（_has_list_timestamp，不依赖固定槽位）。
     先判 result（底部 tab 栏是其独有特征），再判 list。
     """
     if _is_result_page(client_img):
         return "result"
-    if _slot_key(client_img, "slot1") is not None or _slot_key(client_img, "slot2") is not None:
+    if _has_list_timestamp(client_img):
         return "list"
     return "unknown"
 
@@ -225,27 +244,30 @@ def _wait_for_page(target: str, timeout: float = 4.0, interval: float = 0.4) -> 
     return None
 
 
-def _process_slot(save_dir, slot: str, idx: int) -> dict:
-    """点进某槽的战果页 → 提取摘要 → 返回列表页。
+def _process_entry(save_dir, entry: dict, idx: int) -> dict:
+    """点进某条战报的战果页 → 提取摘要 → 返回列表页。
 
-    每步都校验页面状态；点击无效会重试，仍失败则抛 NavigationAborted 立即中止，
-    避免"返回失败却继续在战果页乱点"。
+    entry 来自 _detect_entries（含 click 点与 key）。每步校验页面状态；
+    点击无效会重试，仍失败则抛 NavigationAborted 立即中止，避免在错误页面乱点。
     """
-    # 1) 点击槽位进入战果页，校验确实进入
-    _log(f"[第{idx + 1}封] 在 list 页点击 {slot}，尝试进入 result 页…")
+    click_xy = entry["click"]
+    key = entry["key"]
+
+    # 1) 点击战报进入战果页，校验确实进入
+    _log(f"[第{idx + 1}封] 在 list 页点击战报 {key}，尝试进入 result 页…")
     result_img = None
     for attempt in range(3):
         _check_abort_key()
-        _click_relative(_SLOT_CLICK[slot])
+        _click_relative(click_xy)
         result_img = _wait_for_page("result", timeout=4.0)
         if result_img is not None:
             _log(f"[第{idx + 1}封] ✓ 成功进入 result 页")
             break
-        _log(f"[第{idx + 1}封] ✗ 点击 {slot} 后未进入 result 页，重试 {attempt + 1}/3")
+        _log(f"[第{idx + 1}封] ✗ 点击后未进入 result 页，重试 {attempt + 1}/3")
         if save_dir is not None:
             save_image(_capture_client(), save_dir / f"fail_enter_{idx:04d}_{attempt}.png")
     if result_img is None:
-        raise NavigationAborted(f"点击 {slot} 多次仍未进入战果页，已中止。")
+        raise NavigationAborted("点击战报多次仍未进入战果页，已中止。")
 
     if save_dir is not None:
         save_image(result_img, save_dir / f"result_{idx:04d}.png")
@@ -289,8 +311,9 @@ def navigate_and_collect(save_dir=None, max_battles: int = 200) -> list[dict]:
     - 防卡死：连续多轮无新战报且画面无变化则判定到底/卡住并停止。
     """
     collected: list[dict] = []
+    # 去重主键：时间戳 + 对战双方玩家名（同一秒可能多场战斗，故不能只用时间戳）
     seen: set[tuple[str, str, str]] = set()
-    prev_top_key: tuple | None = None
+    prev_top_ts: tuple | None = None
     stall_rounds = 0  # 连续无进展轮数
 
     try:
@@ -316,57 +339,35 @@ def navigate_and_collect(save_dir=None, max_battles: int = 200) -> list[dict]:
             client_img = _capture_client()
             before_count = len(collected)
 
-            # 分支①：槽1 折叠 → 展开，不滑
-            if _is_folded(client_img, "slot1"):
-                _log("槽1 为折叠态（连战 N 场），点击展开。")
-                _click_relative(_EXPAND_CLICK)
-                time.sleep(0.6)
-                stall_rounds += 1  # 展开本身不算进展，但用计数兜底防死循环
-                continue
+            # 时间戳锚点动态检测当前屏所有战报（不受「连战 N 场」横幅挤动影响）
+            entries = _detect_entries(client_img)
+            _log(f"当前屏检测到 {len(entries)} 条战报：{[e['key'] for e in entries]}")
 
-            key1 = _slot_key(client_img, "slot1")
-            if key1 is None:
-                _log("槽1 无有效战报，判定到底，停止。")
-                break  # 槽1 都没有有效战报 → 到底
-
-            # 到底判断：滑动后槽1 内容与上轮相同
-            if key1 == prev_top_key and key1 in seen:
-                _log("槽1 内容与上轮相同且已处理，判定到底，停止。")
+            if not entries:
+                _log("当前屏无有效战报，判定到底，停止。")
                 break
 
-            # 处理槽1
-            if key1 not in seen:
-                _log(f"槽1 战报：{key1}")
-                summary = _process_slot(save_dir, "slot1", len(collected))
-                collected.append({"key": key1, "summary": summary})
-                seen.add(key1)
-            else:
-                _log(f"槽1 战报已处理过，跳过：{key1}")
+            # 处理第一条「未处理且可点（未被底部截断）」的战报
+            target = next(
+                (e for e in entries if e["key"] not in seen and e["clickable"]), None
+            )
 
-            # 重新截屏判断槽2（处理槽1 进出后画面可能微动）
-            client_img = _capture_client()
-
-            # 分支②：槽2 折叠 → 只滑 1 封，让折叠落到槽1
-            if _is_folded(client_img, "slot2"):
-                _log("槽2 为折叠态，只上滑 1 封让其落到槽1。")
-                prev_top_key = key1
-                _scroll_up(1)
-                stall_rounds = 0 if len(collected) > before_count else stall_rounds + 1
+            if target is not None:
+                _log(f"处理战报：{target['key']}  点击点={target['click']}")
+                summary = _process_entry(save_dir, target, len(collected))
+                collected.append({"key": target["key"], "summary": summary})
+                seen.add(target["key"])
+                # 处理后画面/布局可能变化，重新检测，不立即滚动
+                stall_rounds = 0
                 continue
 
-            key2 = _slot_key(client_img, "slot2")
-            # 分支③：槽2 普通且有效 → 处理槽2
-            if key2 is not None and key2 not in seen:
-                _log(f"槽2 战报：{key2}")
-                summary = _process_slot(save_dir, "slot2", len(collected))
-                collected.append({"key": key2, "summary": summary})
-                seen.add(key2)
-            elif key2 is not None:
-                _log(f"槽2 战报已处理过，跳过：{key2}")
-            else:
-                _log("槽2 无有效战报。")
-
-            prev_top_key = key1
+            # 本屏所有战报都已处理（或被底部截断）→ 上滑约 2 封继续
+            top_keys = tuple(e["key"] for e in entries)
+            if top_keys == prev_top_ts:
+                _log("上滑后画面无变化，判定到底，停止。")
+                break
+            prev_top_ts = top_keys
+            _log("本屏战报均已处理，上滑继续。")
             _scroll_up(2)
             stall_rounds = 0 if len(collected) > before_count else stall_rounds + 1
 
