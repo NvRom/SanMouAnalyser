@@ -21,7 +21,6 @@ import pyautogui
 from sanmou_report_analysis.utils.battle_summary import (
     extract_battle_summary,
     parse_entry_key,
-    parse_result,
 )
 from sanmou_report_analysis.utils.control import human_like_move
 from sanmou_report_analysis.utils.geometry import (
@@ -70,6 +69,12 @@ _FOLD_REGION = {
 
 # 折叠图标模板（复用现有资源）
 _FOLD_TEMPLATE_PATH = "./images/fold.png"
+
+# 战果(result)页底部 tab 栏区域（相对客户区）：含「战果/统计/详情/图表」。
+# 实测底栏 y≈600-650px → ~[0.90,1.0]，左半部即四个标签。result 页独有，list 页没有。
+_RESULT_TAB_REGION = [0.0, 0.88, 0.55, 1.0]
+# 命中任意 2 个关键词即判定为 result 页（OCR 容错）。
+_RESULT_TAB_KEYWORDS = ("战果", "统计", "详情", "图表", "回放", "分享", "地点", "收藏")
 
 
 def _capture_client() -> np.ndarray:
@@ -146,13 +151,35 @@ def _is_folded(client_img: np.ndarray, slot: str) -> bool:
     return bool(matched)
 
 
+def _looks_like_datetime(ts: str) -> bool:
+    """判断 OCR 出的数字串是否像「列表页时间戳」。
+
+    列表页时间戳形如 2026/06/21 15:03:03 → 纯数字 14 位。
+    战果页的战损/兵力（如 12013、3974/33000）位数少，借此排除误判。
+    """
+    return ts.isdigit() and len(ts) >= 12
+
+
 def _slot_key(client_img: np.ndarray, slot: str) -> tuple[str, str, str] | None:
-    """槽位去重键 (时间戳, 左名, 右名)；无有效时间戳视为空槽返回 None。"""
+    """槽位去重键 (时间戳, 左名, 右名)；时间戳必须是合法日期时间，否则视为空槽返回 None。"""
     key = parse_entry_key(_slot_image(client_img, slot))
     ts, _name_l, _name_r = key
-    if not ts:
+    if not _looks_like_datetime(ts):
         return None
     return key
+
+
+def _is_result_page(client_img: np.ndarray) -> bool:
+    """战果页判定：底部 tab 栏含「战果/统计/详情/图表…」中的 ≥2 个关键词。
+
+    这是 result 页独有且文字清晰、易 OCR 的可靠特征，比中央半透明的「胜/败」更稳。
+    """
+    from sanmou_report_analysis.utils.ocr import ocr_text
+
+    region = _crop_rel(client_img, _RESULT_TAB_REGION)
+    text = "".join(o.text for o in ocr_text(region))
+    hits = sum(1 for kw in _RESULT_TAB_KEYWORDS if kw in text)
+    return hits >= 2
 
 
 # --------------------------------------------------------------------------- #
@@ -161,16 +188,15 @@ def _slot_key(client_img: np.ndarray, slot: str) -> tuple[str, str, str] | None:
 def detect_page(client_img: np.ndarray) -> str:
     """判断当前画面：'result'（战果页）/ 'list'（列表页）/ 'unknown'。
 
-    ⚠️ 列表页每条战报中央**也有**「胜/败」大字，因此不能用「胜/败」区分两页。
-    可靠区分信号是**时间戳**：列表页每条右上角有日期时间，战果页没有。
-    故先判列表页（槽位有时间戳），再判战果页（中央有胜/败且无时间戳）。
+    可靠区分信号（避免两页都有的「胜/败」大字造成误判）：
+    - result 页：底部有「战果/统计/详情/图表」tab 栏（_is_result_page）。
+    - list 页：槽位右上角有合法日期时间戳（_slot_key + 严格校验）。
+    先判 result（底部 tab 栏是其独有特征），再判 list。
     """
-    # 列表页：任一槽位能 OCR 到有效时间戳
+    if _is_result_page(client_img):
+        return "result"
     if _slot_key(client_img, "slot1") is not None or _slot_key(client_img, "slot2") is not None:
         return "list"
-    # 战果页：中央有金色胜/败大字，且上面已确认没有列表时间戳
-    if parse_result(client_img) in ("胜", "败"):
-        return "result"
     return "unknown"
 
 
